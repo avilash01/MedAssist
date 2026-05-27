@@ -1,0 +1,7 @@
+data/models
+data/**/*.gguf
+data/vectorstores
+**/__pycache__
+**/*.pyc
+.venv
+medical_bot_env
