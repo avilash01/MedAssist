@@ -1,4 +1,3 @@
 fastapi
 groq
-pypdf
 pydantic

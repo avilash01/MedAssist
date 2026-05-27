@@ -1,19 +1,17 @@
+import json
 import os
 import re
 from functools import lru_cache
-from typing import List, Tuple
+from typing import List, TypedDict
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from groq import Groq
-from pypdf import PdfReader
 from pydantic import BaseModel, Field
 
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PDF_PATH = os.path.join(ROOT_DIR, "data", "Medicine.pdf")
-CHUNK_SIZE = 1200
-CHUNK_OVERLAP = 200
+CHUNKS_PATH = os.path.join(ROOT_DIR, "data", "medicine_chunks.json")
 
 SYSTEM_PROMPT = """You are MedAssist, a careful medical information assistant.
 Use only the provided context to answer. If the context does not contain the
@@ -380,20 +378,25 @@ class ChatResponse(BaseModel):
 app = FastAPI(title="MedAssist API")
 
 
+class Chunk(TypedDict):
+    content: str
+    page: int
+    terms: set[str]
+
+
 @lru_cache(maxsize=1)
-def get_chunks() -> List[Tuple[str, int]]:
-    reader = PdfReader(PDF_PATH)
-    chunks: List[Tuple[str, int]] = []
-    for page_number, page in enumerate(reader.pages, start=1):
-        text = " ".join((page.extract_text() or "").split())
-        if not text:
-            continue
-        start = 0
-        while start < len(text):
-            chunk = text[start : start + CHUNK_SIZE]
-            chunks.append((chunk, page_number))
-            start += CHUNK_SIZE - CHUNK_OVERLAP
-    return chunks
+def get_chunks() -> List[Chunk]:
+    with open(CHUNKS_PATH, "r", encoding="utf-8") as file:
+        raw_chunks = json.load(file)
+
+    return [
+        {
+            "content": item["content"],
+            "page": item["page"],
+            "terms": tokenize(item["content"]),
+        }
+        for item in raw_chunks
+    ]
 
 
 @lru_cache(maxsize=1)
@@ -407,20 +410,19 @@ def tokenize(text: str) -> set[str]:
     return {word for word in re.findall(r"[a-zA-Z]{3,}", text.lower())}
 
 
-def retrieve_context(question: str, limit: int = 4) -> List[Tuple[str, int]]:
+def retrieve_context(question: str, limit: int = 4) -> List[Chunk]:
     query_terms = tokenize(question)
     if not query_terms:
         return get_chunks()[:limit]
 
     scored = []
-    for chunk, page in get_chunks():
-        chunk_terms = tokenize(chunk)
-        score = len(query_terms & chunk_terms)
+    for chunk in get_chunks():
+        score = len(query_terms & chunk["terms"])
         if score:
-            scored.append((score, chunk, page))
+            scored.append((score, chunk))
 
     scored.sort(key=lambda item: item[0], reverse=True)
-    return [(chunk, page) for _, chunk, page in scored[:limit]] or get_chunks()[:limit]
+    return [chunk for _, chunk in scored[:limit]] or get_chunks()[:limit]
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -438,7 +440,7 @@ def chat(payload: ChatRequest):
     try:
         docs = retrieve_context(payload.question)
         context = "\n\n".join(
-            f"Source page {page}:\n{chunk}" for chunk, page in docs
+            f"Source page {doc['page']}:\n{doc['content']}" for doc in docs
         )
         response = get_groq_client().chat.completions.create(
             model=os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
@@ -461,7 +463,7 @@ def chat(payload: ChatRequest):
 
     answer = response.choices[0].message.content or "I do not know."
     sources = [
-        Source(content=chunk[:500], page=page)
-        for chunk, page in docs
+        Source(content=doc["content"][:500], page=doc["page"])
+        for doc in docs
     ]
     return ChatResponse(answer=answer, sources=sources)
